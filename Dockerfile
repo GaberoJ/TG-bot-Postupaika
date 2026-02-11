@@ -12,6 +12,6 @@ COPY parsing/ ./parsing/
 COPY migrations/ ./migrations/
 COPY work_with_db.py ./bot/
 COPY entrypoint.sh .
-RUN chmod +x entrypoint.sh
+RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
 ENTRYPOINT ["bash", "entrypoint.sh"]
