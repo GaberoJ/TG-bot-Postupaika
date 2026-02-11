@@ -1,14 +1,15 @@
+import os
 import psycopg2
 
 
 class DatabaseManager:
     def __init__(self):
         self.conn = psycopg2.connect(
-            host='localhost',
-            port='5432',
-            database='project_db',
-            user='postgres',
-            password='123'
+            host=os.getenv('POSTGRES_HOST', 'localhost'),
+            port=os.getenv('POSTGRES_PORT', '5432'),
+            database=os.getenv('POSTGRES_DB', 'project_db'),
+            user=os.getenv('POSTGRES_USER', 'postgres'),
+            password=os.getenv('POSTGRES_PASSWORD', '123')
         )
 
     def create_table(self, table_name, columns):
@@ -41,7 +42,7 @@ class DatabaseManager:
         values = ', '.join(['%s'] * len(data))
 
         insert_query = f"""
-        INSERT INTO {table_name} ({columns}) 
+        INSERT INTO {table_name} ({columns})
         VALUES ({values})
         ON CONFLICT (name) DO NOTHING
         """

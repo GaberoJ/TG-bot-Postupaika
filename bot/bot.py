@@ -1,6 +1,7 @@
 import asyncio
 import re
 import openai
+import psycopg2
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
@@ -8,7 +9,10 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart
 
-from config import TELEGRAM_TOKEN, my_key
+from config import (
+    TELEGRAM_TOKEN, YANDEX_API_KEY, YANDEX_PROJECT_ID, YANDEX_AGENT_ID,
+    DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
+)
 
 # ================= TELEGRAM =================
 
@@ -21,12 +25,12 @@ dp = Dispatcher()
 # ================= YANDEX AGENT =================
 
 client = openai.OpenAI(
-    api_key=my_key,
+    api_key=YANDEX_API_KEY,
     base_url="https://rest-assistant.api.cloud.yandex.net/v1",
-    project="b1gblc7ca9fb1rj110cf"
+    project=YANDEX_PROJECT_ID
 )
 
-AGENT_ID = "fvto5ko9l2ckfuadm2k2"
+AGENT_ID = YANDEX_AGENT_ID
 
 # ================= STORAGE =================
 
@@ -131,6 +135,112 @@ async def ensure_10(user_id: int, first_answer: str):
 
     directions = extract_directions(follow)
     return directions[:10]
+
+
+# ================= DATABASE =================
+
+def _get_conn():
+    return psycopg2.connect(
+        host=DB_HOST, port=DB_PORT,
+        database=DB_NAME, user=DB_USER, password=DB_PASSWORD
+    )
+
+
+def _query_direction_info(direction_name: str) -> dict | None:
+    """Получить информацию о направлении по имени."""
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            d.num_dir, d.name_dir,
+            COUNT(DISTINCT p.id) as program_count,
+            COUNT(DISTINCT v.id) as vuz_count,
+            COUNT(DISTINCT v.city) as city_count,
+            MIN(p.education_cost_from) FILTER (WHERE p.education_cost_from > 0) as min_cost,
+            SUM(p.count_budget) as total_budget
+        FROM directions d
+        LEFT JOIN programs p ON p.direction_id = d.id
+        LEFT JOIN vuzi v ON v.id = p.vuz_id
+        WHERE d.name_dir ILIKE %s
+        GROUP BY d.id, d.num_dir, d.name_dir
+        LIMIT 1
+    """, (f"%{direction_name}%",))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "num_dir": row[0], "name_dir": row[1],
+        "program_count": row[2], "vuz_count": row[3],
+        "city_count": row[4], "min_cost": row[5],
+        "total_budget": row[6]
+    }
+
+
+def _query_cities(direction_name: str) -> list[dict]:
+    """Получить города, в которых есть направление."""
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT v.city, COUNT(DISTINCT v.id) as vuz_count
+        FROM vuzi v
+        JOIN programs p ON p.vuz_id = v.id
+        JOIN directions d ON d.id = p.direction_id
+        WHERE d.name_dir ILIKE %s AND v.city IS NOT NULL
+        GROUP BY v.city
+        ORDER BY vuz_count DESC
+    """, (f"%{direction_name}%",))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"city": r[0], "vuz_count": r[1]} for r in rows]
+
+
+def _query_programs_in_city(direction_name: str, city: str) -> list[dict]:
+    """Получить программы по направлению в конкретном городе."""
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            v.name as vuz_name,
+            p.name as program_name,
+            p.has_budget, p.count_budget,
+            p.has_contract, p.count_contract,
+            p.education_cost_from,
+            e_b.passing_grade as budget_pass,
+            e_b.average_passing_grade as budget_avg,
+            e_c.passing_grade as contract_pass
+        FROM programs p
+        JOIN vuzi v ON v.id = p.vuz_id
+        JOIN directions d ON d.id = p.direction_id
+        LEFT JOIN entrance e_b ON e_b.program_id = p.id AND e_b.type = 'budget'
+        LEFT JOIN entrance e_c ON e_c.program_id = p.id AND e_c.type = 'contract'
+        WHERE d.name_dir ILIKE %s AND v.city = %s
+        ORDER BY e_b.passing_grade DESC NULLS LAST
+    """, (f"%{direction_name}%", city))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{
+        "vuz": r[0], "program": r[1],
+        "has_budget": r[2], "count_budget": r[3],
+        "has_contract": r[4], "count_contract": r[5],
+        "cost": r[6], "budget_pass": r[7],
+        "budget_avg": r[8], "contract_pass": r[9]
+    } for r in rows]
+
+
+async def get_direction_info(name: str):
+    return await asyncio.to_thread(_query_direction_info, name)
+
+
+async def get_cities(name: str):
+    return await asyncio.to_thread(_query_cities, name)
+
+
+async def get_programs_in_city(name: str, city: str):
+    return await asyncio.to_thread(_query_programs_in_city, name, city)
 
 
 # ================= COMMANDS =================
@@ -294,10 +404,22 @@ async def text_handler(message: Message):
                 await message.answer("⚠️ Уже сохранено", reply_markup=direction_actions())
 
         elif text == "ℹ️ Информация":
-            await message.answer(
-                f"ℹ️ Информация о направлении",
-                reply_markup=direction_actions()
-            )
+            info = await get_direction_info(selected_direction[uid])
+            if info:
+                info_text = (
+                    f"<b>{info['name_dir']}</b>\n"
+                    f"Код: {info['num_dir']}\n\n"
+                    f"Программ: {info['program_count']}\n"
+                    f"Вузов: {info['vuz_count']}\n"
+                    f"Городов: {info['city_count']}\n"
+                )
+                if info['total_budget']:
+                    info_text += f"Бюджетных мест (всего): {info['total_budget']}\n"
+                if info['min_cost']:
+                    info_text += f"Стоимость от: {info['min_cost']:,} руб./год\n".replace(",", " ")
+            else:
+                info_text = f"Направление «{selected_direction[uid]}» не найдено в базе."
+            await message.answer(info_text, reply_markup=direction_actions())
 
         elif text == "🏫 Вузы":
             user_state[uid] = "universities"
@@ -316,16 +438,24 @@ async def text_handler(message: Message):
     if state == "universities":
 
         if text == "🌍 Все города":
-            cities = ["Москва, название вуза", "Санкт-Петербург, название вуза", "Казань, название вуза",
-                      "Новосибирск, название вуза"]
+            cities_data = await get_cities(selected_direction[uid])
+
+            if not cities_data:
+                await message.answer(
+                    "Города не найдены для этого направления.",
+                    reply_markup=universities_menu()
+                )
+                return
+
+            cities = [c["city"] for c in cities_data]
             cities_storage[uid] = cities
             user_state[uid] = "choose_city"
 
-            city_text = ""
-            for i, c in enumerate(cities, 1):
-                city_text += f"{i}. {c}\n"
+            city_text = "<b>Города:</b>\n\n"
+            for i, c in enumerate(cities_data, 1):
+                city_text += f"{i}. {c['city']} ({c['vuz_count']} вуз.)\n"
 
-            city_text += "\nВыберите номер города, про который хотите узнать конкретнее."
+            city_text += "\nВыберите номер города."
 
             await message.answer(city_text, reply_markup=back_menu())
 
@@ -355,12 +485,44 @@ async def text_handler(message: Message):
     if state == "city_detail":
 
         if text.startswith("ℹ️ Информация"):
-            await message.answer(
-                f"Информация о направлении \"{selected_direction[uid]}\" "
-                f"в городе {selected_city[uid]}.\n\n"
-                f"(Заглушка — здесь будет информация из БД)",
-                reply_markup=city_detail_menu(selected_direction[uid])
+            programs = await get_programs_in_city(
+                selected_direction[uid], selected_city[uid]
             )
+
+            if not programs:
+                await message.answer(
+                    "Программы не найдены.",
+                    reply_markup=city_detail_menu(selected_direction[uid])
+                )
+            else:
+                result = f"<b>{selected_direction[uid]}</b>\n"
+                result += f"Город: {selected_city[uid]}\n\n"
+
+                for p in programs[:10]:
+                    result += f"<b>{p['vuz']}</b>\n"
+                    if p['program']:
+                        result += f"  {p['program']}\n"
+                    if p['has_budget'] and p['count_budget']:
+                        result += f"  Бюджет: {p['count_budget']} мест"
+                        if p['budget_pass']:
+                            result += f" | проходной {p['budget_pass']}"
+                        if p['budget_avg']:
+                            result += f" (средний {p['budget_avg']})"
+                        result += "\n"
+                    if p['has_contract'] and p['cost']:
+                        result += f"  Контракт: от {p['cost']:,} руб.".replace(",", " ")
+                        if p['contract_pass']:
+                            result += f" | проходной {p['contract_pass']}"
+                        result += "\n"
+                    result += "\n"
+
+                if len(programs) > 10:
+                    result += f"<i>...и ещё {len(programs) - 10} программ</i>"
+
+                await message.answer(
+                    result,
+                    reply_markup=city_detail_menu(selected_direction[uid])
+                )
 
         elif text == "🔙 Назад":
             user_state[uid] = "choose_city"
