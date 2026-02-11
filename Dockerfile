@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot/ ./bot/
 COPY parsing/ ./parsing/
 COPY migrations/ ./migrations/
+COPY work_with_db.py ./bot/
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
