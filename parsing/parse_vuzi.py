@@ -71,7 +71,7 @@ if __name__ == "__main__":
     lst_of_vuzes = []
 
     print("Генерируем URL страниц с пагинацией")
-    page_urls = pagination(base_url, max_pages=2)  # Всего 58 страниц (включая base_url)
+    page_urls = pagination(base_url, max_pages=1)  # Всего 59 страниц (включая base_url)
     print(f"Будет обработано страниц: {len(page_urls)}")
 
     print("\nПарсим вузы со всех страниц...")
@@ -79,7 +79,7 @@ if __name__ == "__main__":
         print(f"Обрабатываем страницу {i}/{len(page_urls)}")
         page_vuzi = parse_vuzi_from_page(page_url)
         lst_of_vuzes.extend(page_vuzi)
-        time.sleep(0.5)
+        time.sleep(0.4)
 
     print(f"\nВсего собрано вузов: {len(lst_of_vuzes)}")
 
@@ -92,9 +92,9 @@ if __name__ == "__main__":
             break
         if i % 10 == 0:
             print(f"Прогресс: вуз {i}/{len(lst_of_vuzes)}")
-            time.sleep(1)
+            time.sleep(0.5)
 
     print("\nГотово! Все данные собраны.")
-    # print("\nРезультаты:")
-    # for i, vuz in enumerate(lst_of_vuzes, 1):
-    #     print(f"{i}. {vuz.name} | {vuz.city} | {vuz.link}")
+    print("\nРезультаты:")
+    for i, vuz in enumerate(lst_of_vuzes, 1):
+        print(f"{i}. {vuz.name} | {vuz.city} | {vuz.link}")

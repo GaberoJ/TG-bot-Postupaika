@@ -4,10 +4,11 @@ import psycopg2
 class DatabaseManager:
     def __init__(self):
         self.conn = psycopg2.connect(
-            host='',
-            database='myproject',
-            user='',
-            password=''
+            host='localhost',
+            port='5432',
+            database='project_db',
+            user='postgres',
+            password='123'
         )
 
     def create_table(self, table_name, columns):
@@ -42,6 +43,7 @@ class DatabaseManager:
         insert_query = f"""
         INSERT INTO {table_name} ({columns}) 
         VALUES ({values})
+        ON CONFLICT (name) DO NOTHING
         """
 
         cur.execute(insert_query, list(data.values()))
@@ -54,21 +56,4 @@ class DatabaseManager:
 
 if __name__ == "__main__":
     db = DatabaseManager()
-
-    # db.create_table("vuzi", [
-    #     "name VARCHAR(255) NOT NULL UNIQUE",
-    #     "city VARCHAR(100)",
-    #     "link TEXT"
-    # ])
-
-    # test_data = {
-    #     'name': 'Тестовый университет2',
-    #     'city': 'Москва',
-    #     'link_po': 'https://example.com'
-    # }
-    #
-    # db.insert_data("vuzi", test_data)
-
-    # db.drop_table("vuzi")
-
     db.close()
