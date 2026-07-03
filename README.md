@@ -30,4 +30,4 @@
 
 ## Презентация проекта
 
-https://docs.google.com/presentation/d/14ACU14MCbyU1SFC2_9vn-MjjROY6Rmkk_VKwCEsVM-s/edit?slide=id.g3c77ddc82ad_0_0#slide=id.g3c77ddc82ad_0_0
+https://disk.yandex.ru/i/_IOvN5FUvZ1BaQ
