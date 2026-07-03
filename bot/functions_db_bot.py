@@ -190,9 +190,148 @@ class DatabaseBot:
         if program_data.get('program_link'):
             text += f"🔗 Программа: {program_data['program_link']}\n"
         if program_data.get('vuz_link'):
-            text += f"🏛 Сайт вуза: {program_data['vuz_link']}\n"
+            text += f"🏛 О вузе: {program_data['vuz_link']}\n"
 
         return text
+
+    def get_top_low_passing_score(self, direction_name: str, limit: int = 10):
+        """Топ-10 программ с самым низким проходным баллом (без дубликатов)"""
+        cursor = self.conn.cursor(cursor_factory=DictCursor)
+        try:
+            query = """
+            SELECT DISTINCT ON (p.id, e.passing_grade)
+                p.id as program_id,
+                v.name as vuz_name,
+                v.city,
+                d.name_dir as direction_name,
+                p.name as program_name,
+                p.education_lvl,
+                e.passing_grade,
+                e.average_passing_grade,
+                p.education_cost_from,
+                p.has_budget,
+                p.count_budget
+            FROM programs p
+            JOIN vuzi v ON p.vuz_id = v.id
+            JOIN directions d ON p.direction_id = d.id
+            LEFT JOIN entrance e ON p.id = e.program_id AND e.type = 'budget'
+            WHERE d.name_dir = %s 
+              AND e.passing_grade > 0
+              AND e.passing_grade IS NOT NULL
+            ORDER BY e.passing_grade ASC, p.id
+            LIMIT %s
+            """
+            cursor.execute(query, (direction_name, limit))
+            results = cursor.fetchall()
+            return [dict(row) for row in results]
+        except Exception as e:
+            print(f"Ошибка получения топа низких баллов: {e}")
+            return []
+        finally:
+            cursor.close()
+
+    def get_top_high_passing_score(self, direction_name: str, limit: int = 10):
+        """Топ-10 программ с самым высоким проходным баллом (без дубликатов)"""
+        cursor = self.conn.cursor(cursor_factory=DictCursor)
+        try:
+            query = """
+            SELECT DISTINCT ON (p.id, e.passing_grade)
+                p.id as program_id,
+                v.name as vuz_name,
+                v.city,
+                d.name_dir as direction_name,
+                p.name as program_name,
+                p.education_lvl,
+                e.passing_grade,
+                e.average_passing_grade,
+                p.education_cost_from,
+                p.has_budget,
+                p.count_budget
+            FROM programs p
+            JOIN vuzi v ON p.vuz_id = v.id
+            JOIN directions d ON p.direction_id = d.id
+            LEFT JOIN entrance e ON p.id = e.program_id AND e.type = 'budget'
+            WHERE d.name_dir = %s 
+              AND e.passing_grade > 0
+              AND e.passing_grade IS NOT NULL
+            ORDER BY e.passing_grade DESC, p.id
+            LIMIT %s
+            """
+            cursor.execute(query, (direction_name, limit))
+            results = cursor.fetchall()
+            return [dict(row) for row in results]
+        except Exception as e:
+            print(f"Ошибка получения топа высоких баллов: {e}")
+            return []
+        finally:
+            cursor.close()
+
+
+    def search_city(self, direction_name: str, city_query: str):
+        """Поиск города по частичному совпадению"""
+        cursor = self.conn.cursor(cursor_factory=DictCursor)
+        try:
+            query = """
+            SELECT DISTINCT
+                v.city
+            FROM vuzi v
+            JOIN programs p ON v.id = p.vuz_id
+            JOIN directions d ON p.direction_id = d.id
+            WHERE d.name_dir = %s 
+              AND v.city ILIKE %s
+            ORDER BY v.city
+            """
+            cursor.execute(query, (direction_name, f"%{city_query}%"))
+            results = cursor.fetchall()
+            return [row[0] for row in results]
+        except Exception as e:
+            print(f"Ошибка поиска города: {e}")
+            return []
+        finally:
+            cursor.close()
+
+    def get_universities_by_city(self, direction_name: str, city: str):
+        """Получить вузы в конкретном городе по направлению"""
+        cursor = self.conn.cursor(cursor_factory=DictCursor)
+        try:
+            query = """
+            SELECT DISTINCT
+                v.id as vuz_id,
+                v.name as vuz_name,
+                v.city
+            FROM vuzi v
+            JOIN programs p ON v.id = p.vuz_id
+            JOIN directions d ON p.direction_id = d.id
+            WHERE d.name_dir = %s AND v.city = %s
+            ORDER BY v.name
+            """
+            cursor.execute(query, (direction_name, city))
+            results = cursor.fetchall()
+            return [dict(row) for row in results]
+        except Exception as e:
+            print(f"Ошибка получения вузов по городу: {e}")
+            return []
+        finally:
+            cursor.close()
+
+    def get_programs_by_direction_count(self, direction_name: str):
+        """Получает количество программ по направлению"""
+        cursor = self.conn.cursor()
+        try:
+            query = """
+            SELECT COUNT(DISTINCT p.id)
+            FROM programs p
+            JOIN directions d ON p.direction_id = d.id
+            WHERE d.name_dir = %s
+            """
+            cursor.execute(query, (direction_name,))
+            result = cursor.fetchone()
+            return result[0] if result else 0
+        except Exception as e:
+            print(f"Ошибка получения количества программ: {e}")
+            return 0
+        finally:
+            cursor.close()
 
     def close(self):
         self.db_manager.close()

@@ -1,6 +1,7 @@
 import asyncio
 import re
 import openai
+import psycopg2
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
@@ -8,7 +9,10 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart
 
-from config import TELEGRAM_TOKEN, my_key
+from config import (
+    TELEGRAM_TOKEN, YANDEX_API_KEY, YANDEX_PROJECT_ID, YANDEX_AGENT_ID,
+    DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
+)
 from functions_db_bot import DatabaseBot
 
 # ================= TELEGRAM =================
@@ -22,17 +26,15 @@ dp = Dispatcher()
 # ================= YANDEX AGENT =================
 
 client = openai.OpenAI(
-    api_key=my_key,
+    api_key=YANDEX_API_KEY,
     base_url="https://rest-assistant.api.cloud.yandex.net/v1",
-    project="b1gblc7ca9fb1rj110cf"
+    project=YANDEX_PROJECT_ID
 )
 
-AGENT_ID = "fvto5ko9l2ckfuadm2k2"
+AGENT_ID = YANDEX_AGENT_ID
 
 # ================= DATABASE =================
 db_bot = DatabaseBot()
-
-# ================= STORAGE =================
 
 # ================= STORAGE =================
 
@@ -46,6 +48,7 @@ selected_city = {}
 cities_storage = {}
 selected_vuz = {}
 universities_list = {}
+agent_ready = {}
 
 
 # ================= KEYBOARDS =================
@@ -55,7 +58,7 @@ def main_menu():
         keyboard=[
             [KeyboardButton(text="📌 Мои направления")],
             [KeyboardButton(text="⭐ Сохранённые направления")],
-            [KeyboardButton(text="⭐ Сохранённые программы")],  # Добавлено
+            [KeyboardButton(text="⭐ Сохранённые программы")],
             [KeyboardButton(text="🔄 Обновить направления")]
         ],
         resize_keyboard=True
@@ -95,7 +98,10 @@ def universities_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🌍 Все города")],
-            [KeyboardButton(text="🔙 Назад")]
+            [KeyboardButton(text="✏️ Ввести город")],
+            [KeyboardButton(text="📉 Топ-10 (низкий проходной)")],
+            [KeyboardButton(text="📈 Топ-10 (высокий проходной)")],
+            [KeyboardButton(text="🔙 В меню")]
         ],
         resize_keyboard=True
     )
@@ -120,6 +126,7 @@ def vuz_actions():
         resize_keyboard=True
     )
 
+
 def programs_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -128,6 +135,7 @@ def programs_menu():
         ],
         resize_keyboard=True
     )
+
 
 def program_actions():
     return ReplyKeyboardMarkup(
@@ -148,6 +156,7 @@ def saved_programs_menu():
         ],
         resize_keyboard=True
     )
+
 
 # ================= AI =================
 
@@ -174,6 +183,112 @@ async def ensure_10(user_id: int, first_answer: str):
     return directions[:10]
 
 
+# ================= DATABASE =================
+
+def _get_conn():
+    return psycopg2.connect(
+        host=DB_HOST, port=DB_PORT,
+        database=DB_NAME, user=DB_USER, password=DB_PASSWORD
+    )
+
+
+def _query_direction_info(direction_name: str) -> dict | None:
+    """Получить информацию о направлении по имени."""
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            d.num_dir, d.name_dir,
+            COUNT(DISTINCT p.id) as program_count,
+            COUNT(DISTINCT v.id) as vuz_count,
+            COUNT(DISTINCT v.city) as city_count,
+            MIN(p.education_cost_from) FILTER (WHERE p.education_cost_from > 0) as min_cost,
+            SUM(p.count_budget) as total_budget
+        FROM directions d
+        LEFT JOIN programs p ON p.direction_id = d.id
+        LEFT JOIN vuzi v ON v.id = p.vuz_id
+        WHERE d.name_dir ILIKE %s
+        GROUP BY d.id, d.num_dir, d.name_dir
+        LIMIT 1
+    """, (f"%{direction_name}%",))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "num_dir": row[0], "name_dir": row[1],
+        "program_count": row[2], "vuz_count": row[3],
+        "city_count": row[4], "min_cost": row[5],
+        "total_budget": row[6]
+    }
+
+
+def _query_cities(direction_name: str) -> list[dict]:
+    """Получить города, в которых есть направление."""
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT v.city, COUNT(DISTINCT v.id) as vuz_count
+        FROM vuzi v
+        JOIN programs p ON p.vuz_id = v.id
+        JOIN directions d ON d.id = p.direction_id
+        WHERE d.name_dir ILIKE %s AND v.city IS NOT NULL
+        GROUP BY v.city
+        ORDER BY vuz_count DESC
+    """, (f"%{direction_name}%",))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"city": r[0], "vuz_count": r[1]} for r in rows]
+
+
+def _query_programs_in_city(direction_name: str, city: str) -> list[dict]:
+    """Получить программы по направлению в конкретном городе."""
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            v.name as vuz_name,
+            p.name as program_name,
+            p.has_budget, p.count_budget,
+            p.has_contract, p.count_contract,
+            p.education_cost_from,
+            e_b.passing_grade as budget_pass,
+            e_b.average_passing_grade as budget_avg,
+            e_c.passing_grade as contract_pass
+        FROM programs p
+        JOIN vuzi v ON v.id = p.vuz_id
+        JOIN directions d ON d.id = p.direction_id
+        LEFT JOIN entrance e_b ON e_b.program_id = p.id AND e_b.type = 'budget'
+        LEFT JOIN entrance e_c ON e_c.program_id = p.id AND e_c.type = 'contract'
+        WHERE d.name_dir ILIKE %s AND v.city = %s
+        ORDER BY e_b.passing_grade DESC NULLS LAST
+    """, (f"%{direction_name}%", city))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{
+        "vuz": r[0], "program": r[1],
+        "has_budget": r[2], "count_budget": r[3],
+        "has_contract": r[4], "count_contract": r[5],
+        "cost": r[6], "budget_pass": r[7],
+        "budget_avg": r[8], "contract_pass": r[9]
+    } for r in rows]
+
+
+async def get_direction_info(name: str):
+    return await asyncio.to_thread(_query_direction_info, name)
+
+
+async def get_cities(name: str):
+    return await asyncio.to_thread(_query_cities, name)
+
+
+async def get_programs_in_city(name: str, city: str):
+    return await asyncio.to_thread(_query_programs_in_city, name, city)
+
+
 # ================= COMMANDS =================
 
 @dp.message(CommandStart())
@@ -186,7 +301,10 @@ async def start_cmd(message: Message):
         "Ты можешь:\n"
         "• Получить список направлений по своим интересам\n"
         "• Сохранить понравившиеся варианты\n"
-        "• Посмотреть в каких городах есть это направление\n\n"
+        "• Посмотреть в каких городах есть это направление\n"
+        "• Найти программы обучения по выбранному направлению\n"
+        "• Узнать подробности о каждой программе обучения \n\n"
+
         "Нажми <b>«🔄 Обновить направления»</b>, чтобы начать.",
         reply_markup=main_menu()
     )
@@ -197,9 +315,13 @@ async def update_dirs(message: Message):
     uid = message.from_user.id
     dialog_context.pop(uid, None)
     user_directions.pop(uid, None)
+    agent_ready.pop(uid, None)
     user_state[uid] = "dialog"
     await message.answer(
-        "Давай обновим направления 😊\nНапиши, что тебе нравится.",
+        "Давай обновим направления!\n"
+        "Что тебе нравится? По каким предметам ты планируешь сдавать ЕГЭ? "
+        "И самое главное - чем ты увлекаешься в жизни?\n\n"
+        "Чем подробнее опишешь свои увлечения, тем точнее будет результат!",
         reply_markup=back_menu()
     )
 
@@ -281,6 +403,8 @@ async def clear_saved_programs_prompt(message: Message):
         "Введите номера программ через запятую (например: 1,3,5)",
         reply_markup=back_menu()
     )
+
+
 # ================= MAIN TEXT HANDLER =================
 
 @dp.message(F.text)
@@ -314,13 +438,24 @@ async def text_handler(message: Message):
     # ===== ДИАЛОГ С АГЕНТОМ =====
     if state == "dialog":
         answer = await ask_agent(uid, text)
-        directions = await ensure_10(uid, answer)
-        user_directions[uid] = directions
-        user_state[uid] = "choose"
-        await message.answer(
-            answer + "\n\nНапишите номер направления, чтобы узнать про него подробнее.",
-            reply_markup=back_menu()
-        )
+
+        directions = extract_directions(answer)
+
+        if len(directions) >= 3:
+            directions = await ensure_10(uid, answer)
+            user_directions[uid] = directions
+            user_state[uid] = "choose"
+            agent_ready[uid] = True
+
+            await message.answer(
+                answer + "\n\nНапишите номер направления, чтобы узнать про него подробнее.",
+                reply_markup=back_menu()
+            )
+        else:
+            await message.answer(
+                answer,
+                reply_markup=back_menu()
+            )
         return
 
     # ===== ОЧИСТКА СОХРАНЁННЫХ =====
@@ -346,31 +481,68 @@ async def text_handler(message: Message):
                 await message.answer("⚠️ Уже сохранено", reply_markup=direction_actions())
 
         elif text == "ℹ️ Информация":
-            await message.answer(
-                f"ℹ️ Информация о направлении",
-                reply_markup=direction_actions()
-            )
+            info = await get_direction_info(selected_direction[uid])
+            if info:
+                info_text = (
+                    f"🎯 <b>{info['name_dir']}</b>\n"
+                    f"🔖 Код: {info['num_dir']}\n\n"
+                    f"📦 Всего программ: {info['program_count']}\n"
+                    f"🏛  Вузов: {info['vuz_count']}\n"
+                    f"🏙  Городов: {info['city_count']}\n"
+                )
+                if info['total_budget']:
+                    info_text += f"💰 Бюджетных мест (всего): {info['total_budget']}\n"
+                if info['min_cost']:
+                    info_text += f"💵 Стоимость от: {info['min_cost']:,} руб./год\n".replace(",", " ")
+            else:
+                info_text = f"Направление «{selected_direction[uid]}» не найдено в базе."
+            await message.answer(info_text, reply_markup=direction_actions())
 
         elif text == "🏫 Вузы":
-            user_state[uid] = "universities"
-            await message.answer(
-                "Выберите действие:",
-                reply_markup=universities_menu()
+            direction = selected_direction.get(uid)
+            if not direction:
+                await message.answer("Ошибка: направление не выбрано", reply_markup=main_menu())
+                return
+
+            universities = db_bot.get_universities_by_direction(direction)
+
+            if not universities:
+                await message.answer(
+                    f"❌ По направлению «{direction}» нет информации о вузах",
+                    reply_markup=direction_actions()
+                )
+                return
+
+            cities_count = len(set([u['city'] for u in universities]))
+            programs_count = db_bot.get_programs_by_direction_count(direction)
+
+            universities_list[uid] = universities
+
+            # Показываем статистику
+            stats_text = (
+                f"<b>🏫 {direction}</b>\n\n"
+                f"🏙 Найдено городов: {cities_count}\n"
+                f"Выберите действие:"
             )
+
+            user_state[uid] = "universities"
+            await message.answer(stats_text, reply_markup=universities_menu())
 
         elif text == "🔙 К списку":
             user_state[uid] = "choose"
             await my_dirs(message)
         return
 
+
+
     # ===== УРОВЕНЬ ВУЗОВ (МЕНЮ) =====
     if state == "universities":
-        if text == "🌍 Все города":
-            direction = selected_direction.get(uid)
-            if not direction:
-                await message.answer("Ошибка: направление не выбрано", reply_markup=main_menu())
-                return
+        direction = selected_direction.get(uid)
+        if not direction:
+            await message.answer("Ошибка: направление не выбрано", reply_markup=main_menu())
+            return
 
+        if text == "🌍 Все города":
             universities = db_bot.get_universities_by_direction(direction)
             if not universities:
                 await message.answer(
@@ -409,12 +581,190 @@ async def text_handler(message: Message):
                 reply_markup=back_menu()
             )
 
-        elif text == "🔙 Назад":
+        elif text == "✏️ Ввести город":
+            user_state[uid] = "enter_city"
+            await message.answer(
+                "🏙 Введите название города:",
+                reply_markup=back_menu()
+            )
+
+        elif text == "📉 Топ-10 (низкий проходной)":
+            top_programs = db_bot.get_top_low_passing_score(direction, 10)
+
+            if not top_programs:
+                await message.answer(
+                    "❌ Нет данных о проходных баллах по этому направлению",
+                    reply_markup=universities_menu()
+                )
+                return
+
+            result = f"<b>📉 Топ-10 программ с низким проходным баллом</b>\n"
+            result += f"Направление: {direction}\n\n"
+
+            for i, prog in enumerate(top_programs, 1):
+                result += f"{i}. <b>{prog['vuz_name']}</b>\n"
+                result += f"   📍 {prog['city']}\n"
+                if prog.get('program_name'):
+                    result += f"   📚 {prog['program_name']}\n"
+                result += f"   📊 Проходной балл: {prog['passing_grade']}\n"
+                if prog.get('average_passing_grade'):
+                    result += f"   📈 Средний балл: {prog['average_passing_grade']}\n"
+                result += "\n"
+
+            # Разбиваем на части, если слишком длинное
+            if len(result) > 3500:
+                parts = [result[i:i + 3500] for i in range(0, len(result), 3500)]
+                for part in parts:
+                    await message.answer(part, reply_markup=None)
+                    await asyncio.sleep(0.3)
+                await message.answer("Выберите действие:", reply_markup=universities_menu())
+            else:
+                await message.answer(result, reply_markup=universities_menu())
+
+        elif text == "📈 Топ-10 (высокий проходной)":
+            top_programs = db_bot.get_top_high_passing_score(direction, 10)
+
+            if not top_programs:
+                await message.answer(
+                    "❌ Нет данных о проходных баллах по этому направлению",
+                    reply_markup=universities_menu()
+                )
+                return
+
+            result = f"<b>📈 Топ-10 программ с высоким проходным баллом</b>\n"
+            result += f"Направление: {direction}\n\n"
+
+            for i, prog in enumerate(top_programs, 1):
+                result += f"{i}. <b>{prog['vuz_name']}</b>\n"
+                result += f"   📍 {prog['city']}\n"
+                if prog.get('program_name'):
+                    result += f"   📚 {prog['program_name']}\n"
+                result += f"   📊 Проходной балл: {prog['passing_grade']}\n"
+                if prog.get('average_passing_grade'):
+                    result += f"   📈 Средний балл: {prog['average_passing_grade']}\n"
+                result += "\n"
+
+            # Разбиваем на части, если слишком длинное
+            if len(result) > 3500:
+                parts = [result[i:i + 3500] for i in range(0, len(result), 3500)]
+                for part in parts:
+                    await message.answer(part, reply_markup=None)
+                    await asyncio.sleep(0.3)
+                await message.answer("Выберите действие:", reply_markup=universities_menu())
+            else:
+                await message.answer(result, reply_markup=universities_menu())
+
+        elif text == "🔙 В меню":
             user_state[uid] = "actions"
             await message.answer(
-                f"<b>{selected_direction[uid]}</b>\nВыберите действие:",
+                f"<b>{direction}</b>\nВыберите действие:",
                 reply_markup=direction_actions()
             )
+        return
+
+    # ===== ВВОД ГОРОДА =====
+    if state == "enter_city":
+        direction = selected_direction.get(uid)
+        if not direction:
+            await message.answer("Ошибка: направление не выбрано", reply_markup=main_menu())
+            return
+
+        city_query = text.strip()
+
+        # Ищем города по запросу
+        cities = db_bot.search_city(direction, city_query)
+
+        if not cities:
+            await message.answer(
+                f"❌ Город '{city_query}' не найден или в нем нет вузов по направлению «{direction}»",
+                reply_markup=universities_menu()
+            )
+            user_state[uid] = "universities"
+            return
+
+        if len(cities) == 1:
+            # Если найден ровно один город, сразу показываем вузы
+            city = cities[0]
+            universities = db_bot.get_universities_by_city(direction, city)
+
+            if not universities:
+                await message.answer(
+                    f"❌ В городе {city} нет вузов по направлению «{direction}»",
+                    reply_markup=universities_menu()
+                )
+                user_state[uid] = "universities"
+                return
+
+            universities_list[uid] = universities
+            user_state[uid] = "choose_vuz"
+
+            header = f"<b>🏫 {direction}</b>\n"
+            header += f"📍 Город: {city}\n\n"
+            header += f"Всего найдено: {len(universities)} вузов\n\n"
+            await message.answer(header, reply_markup=back_menu())
+
+            # Отправляем список вузов
+            for i, uni in enumerate(universities, 1):
+                await message.answer(f"{i}. {uni['vuz_name']}", reply_markup=None)
+                await asyncio.sleep(0.1)
+
+            await message.answer(
+                "Введите номер вуза, чтобы посмотреть программы:",
+                reply_markup=back_menu()
+            )
+        else:
+            # Если найдено несколько городов, предлагаем выбрать
+            cities_storage[uid] = cities
+            user_state[uid] = "choose_city_from_search"
+
+            text_msg = f"<b>Найдено городов: {len(cities)}</b>\n\n"
+            for i, city in enumerate(cities[:20], 1):
+                text_msg += f"{i}. {city}\n"
+
+            if len(cities) > 20:
+                text_msg += f"\n...и ещё {len(cities) - 20} городов"
+
+            text_msg += "\n\nВведите номер города:"
+            await message.answer(text_msg, reply_markup=back_menu())
+        return
+
+    # ===== ВЫБОР ГОРОДА ИЗ ПОИСКА =====
+    if state == "choose_city_from_search" and text.isdigit():
+        idx = int(text) - 1
+        cities = cities_storage.get(uid, [])
+
+        if 0 <= idx < len(cities):
+            city = cities[idx]
+            direction = selected_direction.get(uid)
+
+            universities = db_bot.get_universities_by_city(direction, city)
+
+            if not universities:
+                await message.answer(
+                    f"❌ В городе {city} нет вузов по направлению «{direction}»",
+                    reply_markup=universities_menu()
+                )
+                user_state[uid] = "universities"
+                return
+
+            universities_list[uid] = universities
+            user_state[uid] = "choose_vuz"
+
+            header = f"<b>🏫 {direction}</b>\n"
+            header += f"📍 Город: {city}\n\n"
+            header += f"Всего найдено: {len(universities)} вузов\n\n"
+            await message.answer(header, reply_markup=back_menu())
+
+            for i, uni in enumerate(universities, 1):
+                await message.answer(f"{i}. {uni['vuz_name']}", reply_markup=None)
+                await asyncio.sleep(0.1)
+
+            await message.answer(
+                "Введите номер вуза, чтобы посмотреть программы:",
+                reply_markup=back_menu()
+            )
+        else:
+            await message.answer("Неверный номер. Попробуйте снова:")
         return
 
     # ===== ВЫБОР ВУЗА =====
@@ -439,57 +789,77 @@ async def text_handler(message: Message):
 
     # ===== ДЕЙСТВИЯ С ВУЗОМ =====
     if state == "vuz_actions":
-        # ===== ДЕЙСТВИЯ С ВУЗОМ =====
-        if state == "vuz_actions":
-            if text == "📚 Программы":
-                direction = selected_direction.get(uid)
-                vuz = selected_vuz.get(uid)
+        if text == "📚 Программы":
+            direction = selected_direction.get(uid)
+            vuz = selected_vuz.get(uid)
 
-                if not direction or not vuz:
-                    await message.answer("Ошибка: данные не найдены", reply_markup=main_menu())
-                    return
-
-                programs = db_bot.get_programs_by_university_and_direction(vuz['vuz_id'], direction)
-
-                if not programs:
-                    await message.answer(
-                        f"❌ В данном вузе нет программ по направлению «{direction}»",
-                        reply_markup=vuz_actions()
-                    )
-                    return
-
-                # СОХРАНЯЕМ программы
-                universities_list[f"{uid}_programs"] = programs
-                user_state[uid] = "choose_program"
-
-                # ФОРМИРУЕМ СПИСОК ПРОГРАММ
-                text_msg = f"<b>📚 Программы обучения</b>\n"
-                text_msg += f"{vuz['vuz_name']}\n"
-                text_msg += f"Направление: {direction}\n\n"
-
-                for i, prog in enumerate(programs, 1):
-                    program_name = prog.get('program_name', prog['direction_name'])
-                    text_msg += f"{i}. {program_name}\n"
-
-                text_msg += "\nВведите номер программы для подробной информации:"
-
-                # ИСПРАВЛЕНО: используем programs_menu вместо back_menu
-                await message.answer(text_msg, reply_markup=programs_menu())
+            if not direction or not vuz:
+                await message.answer("Ошибка: данные не найдены", reply_markup=main_menu())
                 return
 
+            programs = db_bot.get_programs_by_university_and_direction(vuz['vuz_id'], direction)
+
+            if not programs:
+                await message.answer(
+                    f"❌ В данном вузе нет программ по направлению «{direction}»",
+                    reply_markup=vuz_actions()
+                )
+                return
+
+            universities_list[f"{uid}_programs"] = programs
+            user_state[uid] = "choose_program"
+
+            text_msg = f"<b>📚 Программы обучения</b>\n"
+            text_msg += f"{vuz['vuz_name']}\n"
+            text_msg += f"Направление: {direction}\n\n"
+
+            for i, prog in enumerate(programs, 1):
+                program_name = prog.get('program_name', prog['direction_name'])
+                text_msg += f"{i}. {program_name}\n"
+
+            text_msg += "\nВведите номер программы для подробной информации:"
+
+            await message.answer(text_msg, reply_markup=programs_menu())
+            return
 
         elif text == "🔙 Назад":
             user_state[uid] = "choose_vuz"
-            universities = universities_list.get(uid, [])
             direction = selected_direction.get(uid)
+            universities = universities_list.get(uid, [])
 
-            text_msg = f"<b>🏫 {direction}</b>\n\n"
-            for i, uni in enumerate(universities, 1):
-                text_msg += f"{i}. {uni['city']}, {uni['vuz_name']}\n"
-            text_msg += "\nВведите номер вуза:"
+            # Если список вузов потерян, запрашиваем заново
+            if not universities:
+                universities = db_bot.get_universities_by_direction(direction)
+                universities_list[uid] = universities
 
-            await message.answer(text_msg, reply_markup=back_menu())
+            # Разбиваем список вузов на части по 20 записей
+            chunk_size = 20
+            total_universities = len(universities)
+
+            # Отправляем заголовок
+            header = f"<b>🏫 {direction}</b>\n\n"
+            header += f"Всего найдено: {total_universities} вузов\n\n"
+            await message.answer(header, reply_markup=back_menu())
+
+            # Отправляем список частями
+            for chunk_start in range(0, total_universities, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, total_universities)
+                chunk_text = ""
+
+                for i in range(chunk_start, chunk_end):
+                    uni = universities[i]
+                    chunk_text += f"{i + 1}. {uni['city']}, {uni['vuz_name']}\n"
+
+                await message.answer(chunk_text, reply_markup=None)
+                await asyncio.sleep(0.3)
+
+            # Отправляем финальное сообщение с инструкцией
+            await message.answer(
+                "Введите номер вуза, чтобы посмотреть программы:",
+                reply_markup=back_menu()
+            )
             return
+
         return
 
     # ===== ВЫБОР ПРОГРАММЫ =====
@@ -519,12 +889,11 @@ async def text_handler(message: Message):
                     # Форматируем и отправляем полную информацию
                     prog_info = db_bot.format_program_full(program_details)
 
-                    # ОТПРАВКА С ОТКЛЮЧЕННЫМ HTML
                     await message.answer(
                         prog_info,
                         reply_markup=program_actions(),
                         disable_web_page_preview=True,
-                        parse_mode=None  # Отключаем HTML парсинг
+                        parse_mode=None
                     )
                 else:
                     # Если не удалось получить детали, показываем базовую информацию
@@ -536,7 +905,7 @@ async def text_handler(message: Message):
                     universities_list[f"{uid}_selected_program"] = selected_program
                     user_state[uid] = "program_details"
 
-                    prog_info = f"<b>📚 {selected_program.get('program_name', selected_program['direction_name'])}</b>\n"
+                    prog_info = f"📚 {selected_program.get('program_name', selected_program['direction_name'])}\n"
                     prog_info += f"🏫 {selected_program['vuz_name']}\n"
                     prog_info += f"📍 {selected_program['city']}\n"
                     prog_info += f"📋 Направление: {selected_program['direction_name']}\n\n"
@@ -546,6 +915,68 @@ async def text_handler(message: Message):
             else:
                 await message.answer("Неверный номер. Попробуйте снова:")
             return
+
+        elif text == "🔙 К выбору вуза":
+            user_state[uid] = "choose_vuz"
+            direction = selected_direction.get(uid)
+            universities = universities_list.get(uid, [])
+
+            # Если список вузов потерян, запрашиваем заново
+            if not universities:
+                universities = db_bot.get_universities_by_direction(direction)
+                universities_list[uid] = universities
+
+            # Разбиваем список вузов на части по 20 записей
+            chunk_size = 20
+            total_universities = len(universities)
+
+            # Отправляем заголовок
+            header = f"<b>🏫 {direction}</b>\n\n"
+            header += f"Всего найдено: {total_universities} вузов\n\n"
+            await message.answer(header, reply_markup=back_menu())
+
+            # Отправляем список частями
+            for chunk_start in range(0, total_universities, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, total_universities)
+                chunk_text = ""
+
+                for i in range(chunk_start, chunk_end):
+                    uni = universities[i]
+                    chunk_text += f"{i + 1}. {uni['city']}, {uni['vuz_name']}\n"
+
+                await message.answer(chunk_text, reply_markup=None)
+                await asyncio.sleep(0.3)
+
+            # Отправляем финальное сообщение с инструкцией
+            await message.answer(
+                "Введите номер вуза, чтобы посмотреть программы:",
+                reply_markup=back_menu()
+            )
+            return
+
+        elif text == "🔙 В меню":
+            user_state[uid] = "menu"
+            await message.answer("Главное меню:", reply_markup=main_menu())
+            return
+
+        elif text == "📚 Программы":
+            direction = selected_direction.get(uid)
+            vuz = selected_vuz.get(uid)
+            programs = universities_list.get(f"{uid}_programs", [])
+
+            if vuz and programs:
+                text_msg = f"<b>📚 Программы обучения</b>\n"
+                text_msg += f"{vuz['vuz_name']}\n"
+                text_msg += f"Направление: {direction}\n\n"
+
+                for i, prog in enumerate(programs, 1):
+                    program_name = prog.get('program_name', prog['direction_name'])
+                    text_msg += f"{i}. {program_name}\n"
+
+                text_msg += "\nВведите номер программы для подробной информации:"
+                await message.answer(text_msg, reply_markup=programs_menu())
+            return
+        return
 
 
     # ===== ВЫБОР СОХРАНЕННОЙ ПРОГРАММЫ =====
@@ -569,22 +1000,21 @@ async def text_handler(message: Message):
                     universities_list[f"{uid}_selected_program"] = program_details
                     user_state[uid] = "program_details"
 
-                    # Форматируем и отправляем полную информацию по частям
-                    prog_messages = db_bot.format_program_full(program_details)
+                    # Форматируем и отправляем полную информацию
+                    prog_info = db_bot.format_program_full(program_details)
 
-                    for i, msg in enumerate(prog_messages):
-                        await message.answer(
-                            msg,
-                            reply_markup=program_actions() if i == len(prog_messages) - 1 else None,
-                            disable_web_page_preview=True
-                        )
-                        await asyncio.sleep(0.3)
+                    await message.answer(
+                        prog_info,
+                        reply_markup=program_actions(),
+                        disable_web_page_preview=True,
+                        parse_mode=None
+                    )
                 else:
                     # Если не удалось получить детали, показываем сохраненную информацию
                     universities_list[f"{uid}_selected_program"] = selected_program
                     user_state[uid] = "program_details"
 
-                    prog_info = f"<b>📚 {selected_program['program_name']}</b>\n"
+                    prog_info = f"📚 {selected_program['program_name']}\n"
                     prog_info += f"🏫 {selected_program['vuz_name']}\n"
                     prog_info += f"📍 {selected_program['city']}\n"
                     prog_info += f"📋 Направление: {selected_program['direction_name']}\n\n"
@@ -595,6 +1025,20 @@ async def text_handler(message: Message):
                 await message.answer("Неверный номер. Попробуйте снова:")
             return
 
+        elif text == "🗑 Очистить сохранённые программы":
+            user_state[uid] = "clear_saved_programs"
+            await message.answer(
+                "Введите номера программ через запятую (например: 1,3,5)",
+                reply_markup=back_menu()
+            )
+            return
+
+        elif text == "🔙 В меню":
+            user_state[uid] = "menu"
+            await message.answer("Главное меню:", reply_markup=main_menu())
+            return
+
+        return
 
     # ===== ОЧИСТКА СОХРАНЕННЫХ ПРОГРАММ =====
     if state == "clear_saved_programs":
@@ -620,42 +1064,102 @@ async def text_handler(message: Message):
                 await message.answer("Ошибка: программа не выбрана", reply_markup=main_menu())
                 return
 
+            # Проверяем, есть ли ID
+            program_id = selected_program.get('id') or selected_program.get('program_id')
+            if not program_id:
+                await message.answer("❌ Ошибка: ID программы не найден", reply_markup=program_actions())
+                return
+
             # Проверяем, не сохранена ли уже эта программа
             program_exists = False
             for prog in saved_programs[uid]:
-                if prog['id'] == selected_program['id']:
+                if prog['id'] == program_id:
                     program_exists = True
                     break
 
             if not program_exists:
                 # Сохраняем нужные поля
                 program_to_save = {
-                    'id': selected_program['id'],
-                    'program_name': selected_program.get('program_name', selected_program['direction_name']),
-                    'vuz_name': selected_program['vuz_name'],
-                    'city': selected_program['city'],
-                    'direction_name': selected_program['direction_name']
+                    'id': program_id,
+                    'program_name': selected_program.get('program_name',
+                                                         selected_program.get('direction_name', 'Программа')),
+                    'vuz_name': selected_program.get('vuz_name', ''),
+                    'city': selected_program.get('city', ''),
+                    'direction_name': selected_program.get('direction_name', '')
                 }
                 saved_programs[uid].append(program_to_save)
-                await message.answer("⭐ Программа сохранена", reply_markup=program_actions())
+                await message.answer("✅ Программа сохранена!", reply_markup=program_actions())
             else:
-                await message.answer("⚠️ Программа уже сохранена", reply_markup=program_actions())
+                await message.answer("⚠️ Эта программа уже сохранена", reply_markup=program_actions())
+            return
 
         elif text == "🔙 К выбору вуза":
+            # СОХРАНЯЕМ ПРОГРАММУ ПЕРЕД ВОЗВРАТОМ, ЕСЛИ ОНА БЫЛА ВЫБРАНА
+            selected_program = universities_list.get(f"{uid}_selected_program")
+            if selected_program:
+                saved_programs.setdefault(uid, [])
+                program_id = selected_program.get('id') or selected_program.get('program_id')
+
+                if program_id:
+                    # Проверяем, не сохранена ли уже эта программа
+                    program_exists = False
+                    for prog in saved_programs[uid]:
+                        if prog['id'] == program_id:
+                            program_exists = True
+                            break
+
+                    if not program_exists:
+                        program_to_save = {
+                            'id': program_id,
+                            'program_name': selected_program.get('program_name',
+                                                                 selected_program.get('direction_name', 'Программа')),
+                            'vuz_name': selected_program.get('vuz_name', ''),
+                            'city': selected_program.get('city', ''),
+                            'direction_name': selected_program.get('direction_name', '')
+                        }
+                        saved_programs[uid].append(program_to_save)
+
             user_state[uid] = "choose_vuz"
-            universities = universities_list.get(uid, [])
             direction = selected_direction.get(uid)
+            universities = universities_list.get(uid, [])
 
-            text_msg = f"<b>🏫 {direction}</b>\n\n"
-            for i, uni in enumerate(universities, 1):
-                text_msg += f"{i}. {uni['city']}, {uni['vuz_name']}\n"
-            text_msg += "\nВведите номер вуза:"
+            # Если список вузов потерян, запрашиваем заново
+            if not universities:
+                universities = db_bot.get_universities_by_direction(direction)
+                universities_list[uid] = universities
 
-            await message.answer(text_msg, reply_markup=back_menu())
+            # Разбиваем список вузов на части по 20 записей
+            chunk_size = 20
+            total_universities = len(universities)
+
+            # Отправляем заголовок
+            header = f"<b>🏫 {direction}</b>\n\n"
+            header += f"Всего найдено: {total_universities} вузов\n\n"
+            await message.answer(header, reply_markup=back_menu())
+
+            # Отправляем список частями
+            for chunk_start in range(0, total_universities, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, total_universities)
+                chunk_text = ""
+
+                for i in range(chunk_start, chunk_end):
+                    uni = universities[i]
+                    chunk_text += f"{i + 1}. {uni['city']}, {uni['vuz_name']}\n"
+
+                await message.answer(chunk_text, reply_markup=None)
+                await asyncio.sleep(0.3)
+
+            # Отправляем финальное сообщение с инструкцией
+            await message.answer(
+                "Введите номер вуза, чтобы посмотреть программы:",
+                reply_markup=back_menu()
+            )
+            return
 
         elif text == "🔙 В меню":
             user_state[uid] = "menu"
             await message.answer("Главное меню:", reply_markup=main_menu())
+            return
 
         return
 
@@ -674,12 +1178,45 @@ async def text_handler(message: Message):
     # ===== ГОРОД — ДЕТАЛИ =====
     if state == "city_detail":
         if text.startswith("ℹ️ Информация"):
-            await message.answer(
-                f"Информация о направлении \"{selected_direction[uid]}\" "
-                f"в городе {selected_city[uid]}.\n\n"
-                f"(Заглушка — здесь будет информация из БД)",
-                reply_markup=city_detail_menu(selected_direction[uid])
+            programs = await get_programs_in_city(
+                selected_direction[uid], selected_city[uid]
             )
+
+            if not programs:
+                await message.answer(
+                    "Программы не найдены.",
+                    reply_markup=city_detail_menu(selected_direction[uid])
+                )
+            else:
+                result = f"<b>{selected_direction[uid]}</b>\n"
+                result += f"Город: {selected_city[uid]}\n\n"
+
+                for p in programs[:10]:
+                    result += f"<b>{p['vuz']}</b>\n"
+                    if p['program']:
+                        result += f"  {p['program']}\n"
+                    if p['has_budget'] and p['count_budget']:
+                        result += f"  Бюджет: {p['count_budget']} мест"
+                        if p['budget_pass']:
+                            result += f" | проходной {p['budget_pass']}"
+                        if p['budget_avg']:
+                            result += f" (средний {p['budget_avg']})"
+                        result += "\n"
+                    if p['has_contract'] and p['cost']:
+                        result += f"  Контракт: от {p['cost']:,} руб.".replace(",", " ")
+                        if p['contract_pass']:
+                            result += f" | проходной {p['contract_pass']}"
+                        result += "\n"
+                    result += "\n"
+
+                if len(programs) > 10:
+                    result += f"<i>...и ещё {len(programs) - 10} программ</i>"
+
+                await message.answer(
+                    result,
+                    reply_markup=city_detail_menu(selected_direction[uid])
+                )
+
         elif text == "🔙 Назад":
             user_state[uid] = "choose_city"
             cities = cities_storage.get(uid, [])
